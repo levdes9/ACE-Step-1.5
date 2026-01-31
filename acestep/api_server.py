@@ -59,6 +59,128 @@ from acestep.gradio_ui.events.results_handlers import _build_generation_info
 
 
 # =============================================================================
+# Model Auto-Download Support
+# =============================================================================
+
+# Model name to repository mapping
+MODEL_REPO_MAPPING = {
+    # Main unified repository
+    "acestep-v15-turbo": "ACE-Step/Ace-Step1.5",
+    "acestep-5Hz-lm-0.6B": "ACE-Step/Ace-Step1.5",
+    "acestep-5Hz-lm-1.7B": "ACE-Step/Ace-Step1.5",
+    "vae": "ACE-Step/Ace-Step1.5",
+    "Qwen3-Embedding-0.6B": "ACE-Step/Ace-Step1.5",
+    # Separate model repositories
+    "acestep-v15-base": "ACE-Step/acestep-v15-base",
+    "acestep-v15-sft": "ACE-Step/acestep-v15-sft",
+    "acestep-v15-turbo-shift3": "ACE-Step/acestep-v15-turbo-shift3",
+    "acestep-5Hz-lm-4B": "ACE-Step/acestep-5Hz-lm-4B",
+}
+
+DEFAULT_REPO_ID = "ACE-Step/Ace-Step1.5"
+
+
+def _can_access_google(timeout: float = 3.0) -> bool:
+    """Check if Google is accessible (to determine HuggingFace vs ModelScope)."""
+    import socket
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("www.google.com", 443))
+        return True
+    except (socket.timeout, socket.error, OSError):
+        return False
+
+
+def _download_from_huggingface(repo_id: str, local_dir: str, model_name: str) -> str:
+    """Download model from HuggingFace Hub."""
+    from huggingface_hub import snapshot_download
+
+    is_unified_repo = repo_id == DEFAULT_REPO_ID or repo_id == "ACE-Step/Ace-Step1.5"
+
+    if is_unified_repo:
+        download_dir = local_dir
+        print(f"[Model Download] Downloading unified repo {repo_id} to {download_dir}...")
+    else:
+        download_dir = os.path.join(local_dir, model_name)
+        os.makedirs(download_dir, exist_ok=True)
+        print(f"[Model Download] Downloading {model_name} from {repo_id} to {download_dir}...")
+
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=download_dir,
+        local_dir_use_symlinks=False,
+    )
+
+    return os.path.join(local_dir, model_name)
+
+
+def _download_from_modelscope(repo_id: str, local_dir: str, model_name: str) -> str:
+    """Download model from ModelScope."""
+    from modelscope import snapshot_download
+
+    is_unified_repo = repo_id == DEFAULT_REPO_ID or repo_id == "ACE-Step/Ace-Step1.5"
+
+    if is_unified_repo:
+        download_dir = local_dir
+        print(f"[Model Download] Downloading unified repo {repo_id} from ModelScope to {download_dir}...")
+    else:
+        download_dir = os.path.join(local_dir, model_name)
+        os.makedirs(download_dir, exist_ok=True)
+        print(f"[Model Download] Downloading {model_name} from ModelScope {repo_id} to {download_dir}...")
+
+    snapshot_download(
+        model_id=repo_id,
+        local_dir=download_dir,
+    )
+
+    return os.path.join(local_dir, model_name)
+
+
+def _ensure_model_downloaded(model_name: str, checkpoint_dir: str) -> str:
+    """
+    Ensure model is downloaded. Auto-detect source based on network.
+
+    Args:
+        model_name: Model directory name (e.g., "acestep-v15-turbo")
+        checkpoint_dir: Target checkpoint directory
+
+    Returns:
+        Path to the model directory
+    """
+    model_path = os.path.join(checkpoint_dir, model_name)
+
+    # Check if model already exists
+    if os.path.exists(model_path) and os.listdir(model_path):
+        print(f"[Model Download] Model {model_name} already exists at {model_path}")
+        return model_path
+
+    # Get repository ID
+    repo_id = MODEL_REPO_MAPPING.get(model_name, DEFAULT_REPO_ID)
+
+    print(f"[Model Download] Model {model_name} not found, checking network...")
+
+    # Determine download source
+    use_huggingface = _can_access_google()
+
+    if use_huggingface:
+        print("[Model Download] Google accessible, using HuggingFace Hub...")
+        try:
+            return _download_from_huggingface(repo_id, checkpoint_dir, model_name)
+        except Exception as e:
+            print(f"[Model Download] HuggingFace download failed: {e}")
+            print("[Model Download] Falling back to ModelScope...")
+            return _download_from_modelscope(repo_id, checkpoint_dir, model_name)
+    else:
+        print("[Model Download] Google not accessible, using ModelScope...")
+        try:
+            return _download_from_modelscope(repo_id, checkpoint_dir, model_name)
+        except Exception as e:
+            print(f"[Model Download] ModelScope download failed: {e}")
+            print("[Model Download] Trying HuggingFace as fallback...")
+            return _download_from_huggingface(repo_id, checkpoint_dir, model_name)
+
+
+# =============================================================================
 # Constants
 # =============================================================================
 
@@ -767,6 +889,24 @@ def create_app() -> FastAPI:
                 offload_to_cpu = _env_bool("ACESTEP_OFFLOAD_TO_CPU", False)
                 offload_dit_to_cpu = _env_bool("ACESTEP_OFFLOAD_DIT_TO_CPU", False)
 
+                # Auto-download models if not present
+                checkpoint_dir = os.path.join(project_root, "checkpoints")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+
+                # Download primary DiT model
+                dit_model_name = _get_model_name(config_path)
+                if dit_model_name:
+                    try:
+                        _ensure_model_downloaded(dit_model_name, checkpoint_dir)
+                    except Exception as e:
+                        print(f"[API Server] Warning: Failed to download DiT model {dit_model_name}: {e}")
+
+                # Download VAE model (required for all DiT models)
+                try:
+                    _ensure_model_downloaded("vae", checkpoint_dir)
+                except Exception as e:
+                    print(f"[API Server] Warning: Failed to download VAE model: {e}")
+
                 # Initialize primary model
                 status_msg, ok = h.initialize_service(
                     project_root=project_root,
@@ -784,6 +924,14 @@ def create_app() -> FastAPI:
                 
                 # Initialize secondary model if configured
                 if app.state.handler2 and app.state._config_path2:
+                    # Download secondary model if needed
+                    model2_name = _get_model_name(app.state._config_path2)
+                    if model2_name:
+                        try:
+                            _ensure_model_downloaded(model2_name, checkpoint_dir)
+                        except Exception as e:
+                            print(f"[API Server] Warning: Failed to download secondary model {model2_name}: {e}")
+
                     try:
                         status_msg2, ok2 = app.state.handler2.initialize_service(
                             project_root=project_root,
@@ -805,6 +953,14 @@ def create_app() -> FastAPI:
                 
                 # Initialize third model if configured
                 if app.state.handler3 and app.state._config_path3:
+                    # Download third model if needed
+                    model3_name = _get_model_name(app.state._config_path3)
+                    if model3_name:
+                        try:
+                            _ensure_model_downloaded(model3_name, checkpoint_dir)
+                        except Exception as e:
+                            print(f"[API Server] Warning: Failed to download third model {model3_name}: {e}")
+
                     try:
                         status_msg3, ok3 = app.state.handler3.initialize_service(
                             project_root=project_root,
@@ -971,6 +1127,14 @@ def create_app() -> FastAPI:
                         backend = (req.lm_backend or os.getenv("ACESTEP_LM_BACKEND") or "vllm").strip().lower()
                         if backend not in {"vllm", "pt"}:
                             backend = "vllm"
+
+                        # Auto-download LM model if not present
+                        lm_model_name = _get_model_name(lm_model_path)
+                        if lm_model_name:
+                            try:
+                                _ensure_model_downloaded(lm_model_name, checkpoint_dir)
+                            except Exception as e:
+                                print(f"[API Server] Warning: Failed to download LM model {lm_model_name}: {e}")
 
                         lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
                         lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
@@ -1740,6 +1904,14 @@ def create_app() -> FastAPI:
                 if backend not in {"vllm", "pt"}:
                     backend = "vllm"
 
+                # Auto-download LM model if not present
+                lm_model_name = _get_model_name(lm_model_path)
+                if lm_model_name:
+                    try:
+                        _ensure_model_downloaded(lm_model_name, checkpoint_dir)
+                    except Exception as e:
+                        print(f"[API Server] Warning: Failed to download LM model {lm_model_name}: {e}")
+
                 lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
                 lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
 
@@ -1831,6 +2003,14 @@ def create_app() -> FastAPI:
                 backend = os.getenv("ACESTEP_LM_BACKEND", "vllm").strip().lower()
                 if backend not in {"vllm", "pt"}:
                     backend = "vllm"
+
+                # Auto-download LM model if not present
+                lm_model_name = _get_model_name(lm_model_path)
+                if lm_model_name:
+                    try:
+                        _ensure_model_downloaded(lm_model_name, checkpoint_dir)
+                    except Exception as e:
+                        print(f"[API Server] Warning: Failed to download LM model {lm_model_name}: {e}")
 
                 lm_device = os.getenv("ACESTEP_LM_DEVICE", os.getenv("ACESTEP_DEVICE", "auto"))
                 lm_offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", False)
