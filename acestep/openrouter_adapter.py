@@ -528,7 +528,7 @@ def create_openrouter_router(app_state_getter) -> APIRouter:
             )
         else:
             response = await _sync_generation(state, gen_params, req.model, audio_format)
-            print(f"[OpenRouter] _sync_generation returned, response.id={response.id}")
+            print(f"[OpenRouter] _sync_generation returned successfully")
             return response
 
     return router
