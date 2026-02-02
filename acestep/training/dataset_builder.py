@@ -1193,6 +1193,10 @@ class DatasetBuilder:
                     lyrics = "[Instrumental]"
 
                 # Generate audio using DiT directly (no LLM)
+                # Use same duration as original sample (max 240s like target preprocessing)
+                audio_dur = sample.duration if sample.duration else 30
+                audio_dur = min(audio_dur, 240)  # Same limit as preprocess_to_tensors
+
                 result = dit_handler.generate_music(
                     captions=base_prompt,
                     lyrics=lyrics,
@@ -1204,7 +1208,7 @@ class DatasetBuilder:
                     guidance_scale=7.0,
                     use_random_seed=False,
                     seed=42 + i,
-                    audio_duration=min(sample.duration, 60) if sample.duration else 30,
+                    audio_duration=audio_dur,
                     batch_size=1,
                     task_type="text2music",
                 )
@@ -1217,8 +1221,8 @@ class DatasetBuilder:
                     sample_rate = audio_data.get("sample_rate", 48000)
 
                     if audio_tensor is not None:
-                        # Save tensor to wav file
-                        new_path = os.path.join(output_dir, f"prior_{i:04d}.wav")
+                        # Save tensor to wav file using sample ID
+                        new_path = os.path.join(output_dir, f"prior_{sample.id}.wav")
                         torchaudio.save(new_path, audio_tensor, sample_rate)
                         generated_paths.append(new_path)
                         success_count += 1
@@ -1416,7 +1420,12 @@ class DatasetBuilder:
                     }
                 }
 
-                output_path = os.path.join(output_dir, f"prior_{i:04d}.pt")
+                # Extract sample ID from audio filename (prior_{sample_id}.wav)
+                audio_filename = os.path.basename(audio_path)
+                # Remove 'prior_' prefix and extension to get sample_id
+                sample_id = os.path.splitext(audio_filename)[0].replace("prior_", "")
+
+                output_path = os.path.join(output_dir, f"prior_{sample_id}.pt")
                 torch.save(output_data, output_path)
                 output_paths.append(output_path)
                 success_count += 1
