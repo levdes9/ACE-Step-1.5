@@ -1209,13 +1209,17 @@ class DatasetBuilder:
                     task_type="text2music",
                 )
 
-                # dit_handler.generate_music returns dict with 'success', 'audios', 'error'
+                # dit_handler.generate_music returns dict with 'success', 'audios'
+                # audios[i] contains 'tensor' (not 'path'), need to save manually
                 if result.get("success") and result.get("audios"):
-                    audio_path = result["audios"][0].get("path", "")
-                    if audio_path and os.path.exists(audio_path):
-                        # Copy to output_dir with new name
+                    audio_data = result["audios"][0]
+                    audio_tensor = audio_data.get("tensor")
+                    sample_rate = audio_data.get("sample_rate", 48000)
+
+                    if audio_tensor is not None:
+                        # Save tensor to wav file
                         new_path = os.path.join(output_dir, f"prior_{i:04d}.wav")
-                        shutil.copy2(audio_path, new_path)
+                        torchaudio.save(new_path, audio_tensor, sample_rate)
                         generated_paths.append(new_path)
                         success_count += 1
 
@@ -1223,6 +1227,8 @@ class DatasetBuilder:
                             progress_callback(f"✅ Generated prior {i+1}/{num_samples}")
                     else:
                         fail_count += 1
+                        if progress_callback:
+                            progress_callback(f"❌ Failed prior {i+1}: No audio tensor")
                 else:
                     fail_count += 1
                     if progress_callback:
