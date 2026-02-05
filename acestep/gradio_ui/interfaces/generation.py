@@ -48,15 +48,17 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
     init_lm_default = gpu_config.init_lm_default
     
     # Determine default offload setting
-    # If XPU is detected, default offload to False (keep models on device)
+    # If XPU or MPS is detected, default offload to False (keep models on device)
     # Otherwise default to True (offload to CPU to save VRAM)
     default_offload = True
     try:
         import torch
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        if (hasattr(torch, 'xpu') and torch.xpu.is_available()) or \
+           (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
             default_offload = False
     except ImportError:
         pass
+
     
     with gr.Group():
         # Service Configuration - collapse if pre-initialized, hide if in service mode
@@ -168,15 +170,25 @@ def create_generation_section(dit_handler, llm_handler, init_params=None, langua
                     value=offload_dit_to_cpu_value,
                     info=t("service.offload_dit_cpu_info")
                 )
-                # Set compile_model value from init_params if pre-initialized (default True)
-                compile_model_value = init_params.get('compile_model', True) if service_pre_initialized else True
+                # Set compile_model value from init_params if pre-initialized
+                # Default to False on Mac/MPS, True otherwise
+                is_mac = False
+                try:
+                    import torch
+                    is_mac = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+                except: pass
+                
+                default_compile = not is_mac
+                compile_model_value = init_params.get('compile_model', default_compile) if service_pre_initialized else default_compile
                 compile_model_checkbox = gr.Checkbox(
                     label=t("service.compile_model_label"),
                     value=compile_model_value,
                     info=t("service.compile_model_info")
                 )
-                # Set quantization value from init_params if pre-initialized (default True for int8_weight_only)
-                quantization_value = init_params.get('quantization', True) if service_pre_initialized else True
+                # Set quantization value from init_params if pre-initialized
+                # Default to False on Mac/MPS, True otherwise
+                default_quant = not is_mac
+                quantization_value = init_params.get('quantization', default_quant) if service_pre_initialized else default_quant
                 quantization_checkbox = gr.Checkbox(
                     label=t("service.quantization_label"),
                     value=quantization_value,

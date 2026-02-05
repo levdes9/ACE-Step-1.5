@@ -142,6 +142,14 @@ def get_gpu_memory_gb() -> float:
             total_memory = torch.xpu.get_device_properties(0).total_memory
             memory_gb = total_memory / (1024**3)  # Convert bytes to GB
             return memory_gb
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            # For Mac (MPS), use system RAM as it's unified memory
+            try:
+                import psutil
+                memory_gb = psutil.virtual_memory().total / (1024**3)
+                return memory_gb
+            except ImportError:
+                return 0
         else:
             return 0
     except Exception as e:

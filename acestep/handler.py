@@ -349,15 +349,26 @@ class AceStepHandler:
             self.device = device
             self.offload_to_cpu = offload_to_cpu
             self.offload_dit_to_cpu = offload_dit_to_cpu
-            # Set dtype based on device: bfloat16 for cuda, float32 for cpu
-            self.dtype = torch.bfloat16 if device in ["cuda","xpu"] else torch.float32
+            # Set dtype based on device: bfloat16 for cuda/xpu, float32 for mps/cpu
+            # Note: MPS with float16 causes NaN in DiT diffusion steps, so we use float32
+            if device in ["cuda", "xpu"]:
+                self.dtype = torch.bfloat16
+            else:
+                # MPS and CPU both use float32 for numerical stability
+                self.dtype = torch.float32
+                
             self.quantization = quantization
+            if self.quantization is not None and not compile_model:
+                logger.warning("Quantization requires compile_model to be True. Disabling quantization to avoid crash.")
+                self.quantization = None
+            
             if self.quantization is not None:
-                assert compile_model, "Quantization requires compile_model to be True"
                 try:
                     import torchao
                 except ImportError:
-                    raise ImportError("torchao is required for quantization but is not installed. Please install torchao to use quantization features.")
+                    logger.warning("torchao is required for quantization but is not installed. Disabling quantization.")
+                    self.quantization = None
+
                 
 
             # Auto-detect project root (independent of passed project_root parameter)

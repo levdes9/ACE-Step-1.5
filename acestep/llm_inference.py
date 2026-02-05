@@ -254,10 +254,28 @@ class LLMHandler:
         return logits
     
     def _sample_tokens(self, logits: torch.Tensor, temperature: float) -> torch.Tensor:
-        """Sample tokens from logits with temperature"""
+        """Sample tokens from logits with temperature.
+        
+        Includes robust NaN/Inf handling for MPS float16 numerical stability.
+        """
         if temperature > 0:
-            logits = logits / temperature
+            # Clamp logits to prevent overflow in softmax (especially on float16)
+            logits = torch.clamp(logits / temperature, min=-100.0, max=100.0)
+            
+            # Replace any NaN/Inf values with zeros before softmax
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
+            
             probs = torch.softmax(logits, dim=-1)
+            
+            # Handle any remaining NaN in probabilities (fallback to uniform)
+            if torch.isnan(probs).any() or torch.isinf(probs).any() or (probs < 0).any():
+                logger.warning("Invalid probabilities detected, using uniform distribution fallback")
+                probs = torch.ones_like(probs) / probs.shape[-1]
+            
+            # Add small epsilon to prevent zero probabilities
+            probs = probs + 1e-8
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+            
             return torch.multinomial(probs, num_samples=1).squeeze(1)
         else:
             return torch.argmax(logits, dim=-1)
@@ -338,16 +356,24 @@ class LLMHandler:
                     device = "cuda"
                 elif hasattr(torch, 'xpu') and torch.xpu.is_available():
                     device = "xpu"
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    device = "mps"
                 else:
                     device = "cpu"
 
             self.device = device
             self.offload_to_cpu = offload_to_cpu
-            # Set dtype based on device: bfloat16 for cuda, float32 for cpu
+            # Set dtype based on device: bfloat16 for cuda/xpu, float32 for mps/cpu
+            # Note: MPS with float16 causes NaN issues, so we use float32 for stability
             if dtype is None:
-                self.dtype = torch.bfloat16 if device in ["cuda", "xpu"] else torch.float32
+                if device in ["cuda", "xpu"]:
+                    self.dtype = torch.bfloat16
+                else:
+                    # MPS and CPU both use float32 for numerical stability
+                    self.dtype = torch.float32
             else:
                 self.dtype = dtype
+
 
             # If lm_model_path is None, use default
             if lm_model_path is None:
@@ -412,9 +438,20 @@ class LLMHandler:
     def _initialize_5hz_lm_vllm(self, model_path: str) -> str:
         """Initialize 5Hz LM model using vllm backend"""
         if not torch.cuda.is_available():
+            # Optimization: On Mac (MPS) or XPU, we expect vLLM to be unavailable,
+            # so we don't log it as a scary error, just a debug/info message
+            # before the automatic fallback to PyTorch backend in initialize().
+            is_alternative_gpu = (hasattr(torch, 'xpu') and torch.xpu.is_available()) or \
+                                (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available())
+            
+            if is_alternative_gpu:
+                logger.debug("vLLM backend is not supported on Mac/XPU. Falling back to PyTorch.")
+            else:
+                logger.error("CUDA is not available. Please check your GPU setup.")
+                
             self.llm_initialized = False
-            logger.error("CUDA is not available. Please check your GPU setup.")
-            return "❌ CUDA is not available. Please check your GPU setup."
+            return "❌ CUDA is not available. vLLM requires NVIDIA GPU."
+
         try:
             from nanovllm import LLM, SamplingParams
         except ImportError:

@@ -701,7 +701,12 @@ def update_audio_components_visibility(batch_size):
     Row 2: Components 5-8 (batch_size 5-8)
     """
     # Clamp batch size to 1-8 range for UI
-    batch_size = min(max(int(batch_size), 1), 8)
+    try:
+        batch_size = int(batch_size) if batch_size is not None else 1
+    except (ValueError, TypeError):
+        batch_size = 1
+    batch_size = min(max(batch_size, 1), 8)
+
     
     # Row 1 columns (1-4)
     updates_row1 = (
