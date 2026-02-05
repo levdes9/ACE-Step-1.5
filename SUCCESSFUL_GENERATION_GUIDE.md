@@ -63,4 +63,3 @@ uv run acestep --init_service true --offload_to_cpu true --lm_model "ACE-Step-V1
 ```
 *(Ensure you have sufficient disk space for checkpoints and that your Mac has at least 16GB of Unified Memory for optimal speed).*
  
- s
