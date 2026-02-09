@@ -565,6 +565,7 @@ def main():
                        help=f"LLM 模型路径 (默认从 .env: {env_config['ACESTEP_LM_MODEL_PATH']})")
     parser.add_argument("--lm-backend", type=str, default=env_config['ACESTEP_LM_BACKEND'],
                        help=f"LLM 后端 (默认从 .env: {env_config['ACESTEP_LM_BACKEND']})")
+    parser.add_argument("--offload-cpu", action="store_true", help="Offload models to CPU when not in use")
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--detailed", action="store_true")
     parser.add_argument("--llm-debug", action="store_true",
@@ -606,12 +607,14 @@ def main():
     
     dit_handler = AceStepHandler()
     llm_handler = LLMHandler()
-    
-    print("  🎹 Initializing DiT...")
+    # Initialize DiT
+    print(f"Initializing DiT model on {args.device}...")
     status_dit, success_dit = dit_handler.initialize_service(
         project_root=project_root,
         config_path=args.config_path,
         device=args.device,
+        offload_to_cpu=args.offload_cpu,
+        offload_dit_to_cpu=False, # explicit control
         use_flash_attention=True,
     )
     if not success_dit:
@@ -622,10 +625,12 @@ def main():
     print("  🧠 Initializing LLM...")
     if args.thinking or args.use_cot_metas:
         status_llm, success_llm = llm_handler.initialize(
-            checkpoint_dir=args.checkpoint_dir,
+            checkpoint_dir=os.path.join(project_root, "checkpoints"), # Assuming checkpoints dir
             lm_model_path=args.lm_model,
             backend=args.lm_backend,
             device=args.device,
+            offload_to_cpu=args.offload_cpu,
+            dtype=dit_handler.dtype # Match DiT dtype
         )
         if success_llm:
             print(f"     ✓ LLM ready ({args.lm_backend})")

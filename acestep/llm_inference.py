@@ -54,6 +54,37 @@ class LLMHandler:
         # Shared HuggingFace model for perplexity calculation
         self._hf_model_for_scoring = None
 
+    def strict_offload(self):
+        """
+        Atomic purge protocol for LLM.
+        Sequence: model.to("cpu") -> del -> gc -> empty_cache
+        Without model.to("cpu") first, Metal does NOT release physical memory pages.
+        """
+        import gc
+        logger.info("[Purge] Purging LLM from device...")
+        
+        # Atomic purge: move to CPU first so Metal releases pages
+        if hasattr(self, 'llm') and self.llm is not None:
+            try:
+                self.llm.to("cpu")
+            except Exception as e:
+                logger.warning(f"[Purge] Failed to move LLM to CPU: {e}")
+            del self.llm
+        self.llm = None
+        self.llm_initialized = False
+        
+        # Force GC and Cache Clear
+        gc.collect()
+        if self.device == "mps":
+            try:
+                torch.mps.empty_cache()
+            except:
+                pass
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+            
+        logger.info("[Purge] LLM purge complete, cache cleared.")
+
     def _get_checkpoint_dir(self) -> str:
         """Get checkpoint directory, prioritizing persistent storage"""
         if self.persistent_storage_path:
@@ -338,17 +369,6 @@ class LLMHandler:
     ) -> Tuple[str, bool]:
         """
         Initialize 5Hz LM model
-        
-        Args:
-            checkpoint_dir: Checkpoint directory path
-            lm_model_path: LM model path (relative to checkpoint_dir)
-            backend: Backend type ("vllm" or "pt")
-            device: Device type ("auto", "cuda", or "cpu")
-            offload_to_cpu: Whether to offload to CPU
-            dtype: Data type (if None, auto-detect based on device)
-        
-        Returns:
-            (status_message, success)
         """
         try:
             if device == "auto":
@@ -363,77 +383,103 @@ class LLMHandler:
 
             self.device = device
             self.offload_to_cpu = offload_to_cpu
-            # Set dtype based on device: bfloat16 for cuda/xpu, float32 for mps/cpu
-            # Note: MPS with float16 causes NaN issues, so we use float32 for stability
+            
+            # Set dtype
             if dtype is None:
                 if device in ["cuda", "xpu"]:
                     self.dtype = torch.bfloat16
+                elif device == "mps":
+                    self.dtype = torch.float16
                 else:
-                    # MPS and CPU both use float32 for numerical stability
                     self.dtype = torch.float32
             else:
                 self.dtype = dtype
 
-
-            # If lm_model_path is None, use default
+            # Default model path
             if lm_model_path is None:
                 lm_model_path = "acestep-5Hz-lm-1.7B"
                 logger.info(f"[initialize] lm_model_path is None, using default: {lm_model_path}")
 
+            # Store args for reloading
+            self.checkpoint_dir = checkpoint_dir
+            self.lm_model_path = lm_model_path
+            self.backend_arg = backend
+            
+            if self.offload_to_cpu:
+                # TRIAD LIFECYCLE: Do NOT load LLM at init.
+                # Just validate the model path exists. LLM loads on-demand.
+                full_lm_model_path = os.path.join(self.checkpoint_dir, self.lm_model_path)
+                if not os.path.exists(full_lm_model_path):
+                    return f"❌ 5Hz LM model not found at {full_lm_model_path}", False
+                logger.info(f"[initialize] Offload mode: skipping LLM loading (path validated: {full_lm_model_path})")
+                return f"✅ 5Hz LM ready (deferred loading, path: {full_lm_model_path})", True
+            else:
+                result = self._load_models()
+                return result
+            
+        except Exception as e:
+            return f"❌ Error initializing 5Hz LM: {str(e)}\n\nTraceback:\n{traceback.format_exc()}", False
+
+    def _load_models(self) -> Tuple[str, bool]:
+        """Internal method to load LM models"""
+        checkpoint_dir = self.checkpoint_dir
+        lm_model_path = self.lm_model_path
+        backend = self.backend_arg
+        device = self.device
+        
+        try:
             full_lm_model_path = os.path.join(checkpoint_dir, lm_model_path)
             if not os.path.exists(full_lm_model_path):
                 return f"❌ 5Hz LM model not found at {full_lm_model_path}", False
             
-            logger.info("loading 5Hz LM tokenizer... it may take 80~90s")
-            start_time = time.time()
-            # TODO: load tokenizer too slow, not found solution yet
-            llm_tokenizer = AutoTokenizer.from_pretrained(full_lm_model_path, use_fast=True)
-            logger.info(f"5Hz LM tokenizer loaded successfully in {time.time() - start_time:.2f} seconds")
-            self.llm_tokenizer = llm_tokenizer
+            # Load tokenizer (if not already loaded)
+            if self.llm_tokenizer is None:
+                logger.info("loading 5Hz LM tokenizer... it may take 80~90s")
+                start_time = time.time()
+                llm_tokenizer = AutoTokenizer.from_pretrained(full_lm_model_path, use_fast=True)
+                logger.info(f"5Hz LM tokenizer loaded successfully in {time.time() - start_time:.2f} seconds")
+                self.llm_tokenizer = llm_tokenizer
             
-            # Initialize shared constrained decoding processor (one-time initialization)
-            # Use GPU-based max_duration to limit duration values in constrained decoding
-            logger.info("Initializing constrained decoding processor...")
-            processor_start = time.time()
+            # Initialize constrained processor (if not already loaded)
+            if self.constrained_processor is None:
+                logger.info("Initializing constrained decoding processor...")
+                processor_start = time.time()
+                gpu_config = get_global_gpu_config()
+                max_duration_for_constraint = gpu_config.max_duration_with_lm
+                self.constrained_processor = MetadataConstrainedLogitsProcessor(
+                    tokenizer=self.llm_tokenizer,
+                    enabled=True,
+                    debug=False,
+                    max_duration=max_duration_for_constraint,
+                )
+                logger.info(f"Constrained processor initialized in {time.time() - processor_start:.2f} seconds")
             
-            gpu_config = get_global_gpu_config()
-            # Use max_duration_with_lm since LM is being initialized
-            max_duration_for_constraint = gpu_config.max_duration_with_lm
-            logger.info(f"Setting constrained decoding max_duration to {max_duration_for_constraint}s based on GPU config (tier: {gpu_config.tier})")
-            
-            self.constrained_processor = MetadataConstrainedLogitsProcessor(
-                tokenizer=self.llm_tokenizer,
-                enabled=True,
-                debug=False,
-                max_duration=max_duration_for_constraint,
-            )
-            logger.info(f"Constrained processor initialized in {time.time() - processor_start:.2f} seconds")
-            
-            # Initialize based on user-selected backend
+            # Load Model
             if backend == "vllm":
-                # Try to initialize with vllm
                 status_msg = self._initialize_5hz_lm_vllm(full_lm_model_path)
                 logger.info(f"5Hz LM status message: {status_msg}")
-                # Check if initialization failed (status_msg starts with ❌)
                 if status_msg.startswith("❌"):
-                    # vllm initialization failed, fallback to PyTorch
                     if not self.llm_initialized:
                         logger.warning("vllm initialization failed, falling back to PyTorch backend")
                         success, status_msg = self._load_pytorch_model(full_lm_model_path, device)
                         if not success:
                             return status_msg, False
                         status_msg = f"✅ 5Hz LM initialized successfully (PyTorch fallback)\nModel: {full_lm_model_path}\nBackend: PyTorch"
-                # If vllm initialization succeeded, self.llm_initialized should already be True
             else:
-                # Use PyTorch backend (pt)
                 success, status_msg = self._load_pytorch_model(full_lm_model_path, device)
                 if not success:
                     return status_msg, False
             
             return status_msg, True
-            
         except Exception as e:
-            return f"❌ Error initializing 5Hz LM: {str(e)}\n\nTraceback:\n{traceback.format_exc()}", False
+            return f"❌ Error loading models: {e}", False
+
+    def ensure_loaded(self):
+        """Ensure LLM is loaded"""
+        if getattr(self, 'llm', None) is None:
+            logger.info("[ensure_loaded] LLM not found (strict offload active). Reloading LLM...")
+            self._load_models()
+            logger.info("[ensure_loaded] LLM reloaded.")
     
     def _initialize_5hz_lm_vllm(self, model_path: str) -> str:
         """Initialize 5Hz LM model using vllm backend"""
@@ -959,6 +1005,9 @@ class LLMHandler:
         if progress is None:
             def progress(*args, **kwargs):
                 pass
+
+        # Ensure LLM is loaded (Lazy Reloading)
+        self.ensure_loaded()
 
         infer_type = (infer_type or "").strip().lower()
         if infer_type not in {"dit", "llm_dit"}:

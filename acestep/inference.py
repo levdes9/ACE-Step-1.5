@@ -552,6 +552,10 @@ def generate_music(
             if params.use_cot_language:
                 dit_input_vocal_language = lm_generated_metadata.get("vocal_language", dit_input_vocal_language)
 
+            # Strict Offload: Purge LLM before starting DiT if offload enabled
+            if hasattr(llm_handler, "offload_to_cpu") and llm_handler.offload_to_cpu:
+                llm_handler.strict_offload()
+
         # Phase 2: DiT music generation
         # Use seed_for_generation (from config.seed or params.seed) instead of params.seed for actual generation
         result = dit_handler.generate_music(

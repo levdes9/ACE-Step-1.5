@@ -7,6 +7,7 @@ import os
 # Disable tokenizers parallelism to avoid fork warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import gc
 import math
 from copy import deepcopy
 import tempfile
@@ -16,7 +17,7 @@ import random
 import uuid
 import hashlib
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Dict, Any, Tuple, List, Union
 
 import torch
@@ -355,6 +356,7 @@ class AceStepHandler:
                 self.dtype = torch.bfloat16
             else:
                 # MPS and CPU both use float32 for numerical stability
+                # float16/bfloat16 causes assertion failure in MPSNDArrayMatrixMultiplication
                 self.dtype = torch.float32
                 
             self.quantization = quantization
@@ -395,134 +397,49 @@ class AceStepHandler:
                     return f"❌ Failed to download DiT model '{config_path}': {msg}", False
                 logger.info(f"[initialize_service] {msg}")
 
-            # 1. Load main model
-            # config_path is relative path (e.g., "acestep-v15-turbo"), concatenate to checkpoints directory
+            # Store configuration for reloading
+            self.config_path_arg = config_path
+            self.checkpoint_dir = checkpoint_dir
+            self.use_flash_attention = use_flash_attention
+            self.compile_model = compile_model
+
+            # Define paths for status message
             acestep_v15_checkpoint_path = os.path.join(checkpoint_dir, config_path)
-            if os.path.exists(acestep_v15_checkpoint_path):
-                # Determine attention implementation
-                if use_flash_attention and self.is_flash_attention_available():
-                    attn_implementation = "flash_attention_2"
-                    self.dtype = torch.bfloat16
-                else:
-                    attn_implementation = "sdpa"
-
-                try:
-                    logger.info(f"[initialize_service] Attempting to load model with attention implementation: {attn_implementation}")
-                    self.model = AutoModel.from_pretrained(
-                        acestep_v15_checkpoint_path, 
-                        trust_remote_code=True, 
-                        attn_implementation=attn_implementation,
-                        dtype="bfloat16"
-                    )
-                except Exception as e:
-                    logger.warning(f"[initialize_service] Failed to load model with {attn_implementation}: {e}")
-                    if attn_implementation == "sdpa":
-                        logger.info("[initialize_service] Falling back to eager attention")
-                        attn_implementation = "eager"
-                        self.model = AutoModel.from_pretrained(
-                            acestep_v15_checkpoint_path, 
-                            trust_remote_code=True, 
-                            attn_implementation=attn_implementation
-                        )
-                    else:
-                        raise e
-
-                self.model.config._attn_implementation = attn_implementation
-                self.config = self.model.config
-                # Move model to device and set dtype
-                if not self.offload_to_cpu:
-                    self.model = self.model.to(device).to(self.dtype)
-                else:
-                    # If offload_to_cpu is True, check if we should keep DiT on GPU
-                    if not self.offload_dit_to_cpu:
-                        logger.info(f"[initialize_service] Keeping main model on {device} (persistent)")
-                        self.model = self.model.to(device).to(self.dtype)
-                    else:
-                        self.model = self.model.to("cpu").to(self.dtype)
-                self.model.eval()
-                
-                if compile_model:
-                    # Add __len__ method to model to support torch.compile
-                    # torch.compile's dynamo requires this method for introspection
-                    # Note: This modifies the model class, affecting all instances
-                    if not hasattr(self.model.__class__, '__len__'):
-                        def _model_len(model_self):
-                            """Return 0 as default length for torch.compile compatibility"""
-                            return 0
-                        self.model.__class__.__len__ = _model_len
-                    
-                    self.model = torch.compile(self.model)
-                    
-                    if self.quantization is not None:
-                        from torchao.quantization import quantize_
-                        if self.quantization == "int8_weight_only":
-                            from torchao.quantization import Int8WeightOnlyConfig
-                            quant_config = Int8WeightOnlyConfig()
-                        elif self.quantization == "fp8_weight_only":
-                            from torchao.quantization import Float8WeightOnlyConfig
-                            quant_config = Float8WeightOnlyConfig()
-                        elif self.quantization == "w8a8_dynamic":
-                            from torchao.quantization import Int8DynamicActivationInt8WeightConfig, MappingType
-                            quant_config = Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
-                        else:
-                            raise ValueError(f"Unsupported quantization type: {self.quantization}")
-                        
-                        quantize_(self.model, quant_config)
-                        logger.info(f"[initialize_service] DiT quantized with: {self.quantization}")
-                    
-                    
-                silence_latent_path = os.path.join(acestep_v15_checkpoint_path, "silence_latent.pt")
-                if os.path.exists(silence_latent_path):
-                    self.silence_latent = torch.load(silence_latent_path).transpose(1, 2)
-                    # Always keep silence_latent on GPU - it's used in many places outside model context
-                    # and is small enough that it won't significantly impact VRAM
-                    self.silence_latent = self.silence_latent.to(device).to(self.dtype)
-                else:
-                    raise FileNotFoundError(f"Silence latent not found at {silence_latent_path}")
-            else:
-                raise FileNotFoundError(f"ACE-Step V1.5 checkpoint not found at {acestep_v15_checkpoint_path}")
-            
-            # 2. Load VAE
             vae_checkpoint_path = os.path.join(checkpoint_dir, "vae")
-            if os.path.exists(vae_checkpoint_path):
-                self.vae = AutoencoderOobleck.from_pretrained(vae_checkpoint_path)
-                # Use bfloat16 for VAE on GPU, otherwise use self.dtype (float32 on CPU)
-                vae_dtype = self._get_vae_dtype(device)
-                if not self.offload_to_cpu:
-                    self.vae = self.vae.to(device).to(vae_dtype)
-                else:
-                    self.vae = self.vae.to("cpu").to(vae_dtype)
-                self.vae.eval()
-            else:
-                raise FileNotFoundError(f"VAE checkpoint not found at {vae_checkpoint_path}")
-
-            if compile_model:
-                # Add __len__ method to VAE to support torch.compile if needed
-                # Note: This modifies the VAE class, affecting all instances
-                if not hasattr(self.vae.__class__, '__len__'):
-                    def _vae_len(vae_self):
-                        """Return 0 as default length for torch.compile compatibility"""
-                        return 0
-                    self.vae.__class__.__len__ = _vae_len
-                
-                self.vae = torch.compile(self.vae)
-            
-            # 3. Load text encoder and tokenizer
             text_encoder_path = os.path.join(checkpoint_dir, "Qwen3-Embedding-0.6B")
-            if os.path.exists(text_encoder_path):
-                self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_path)
-                self.text_encoder = AutoModel.from_pretrained(text_encoder_path)
-                if not self.offload_to_cpu:
-                    self.text_encoder = self.text_encoder.to(device).to(self.dtype)
-                else:
-                    self.text_encoder = self.text_encoder.to("cpu").to(self.dtype)
-                self.text_encoder.eval()
-            else:
-                raise FileNotFoundError(f"Text encoder not found at {text_encoder_path}")
 
-            # Determine actual attention implementation used
-            actual_attn = getattr(self.config, "_attn_implementation", "eager")
-            
+            if self.offload_to_cpu:
+                # TRIAD LIFECYCLE: Do NOT load models at init.
+                # Only validate checkpoints exist. Models load on-demand in generate_music.
+                logger.info("[initialize_service] Offload mode: skipping model loading (Triad Lifecycle).")
+                for p, name in [(acestep_v15_checkpoint_path, "DiT"), (vae_checkpoint_path, "VAE"), (text_encoder_path, "TextEncoder")]:
+                    if not os.path.exists(p):
+                        return f"❌ Checkpoint not found for {name}: {p}", False
+                
+                # We still need config from DiT for downstream code. Load it without loading weights.
+                from transformers import AutoConfig
+                try:
+                    self.config = AutoConfig.from_pretrained(acestep_v15_checkpoint_path, trust_remote_code=True)
+                except Exception:
+                    # If AutoConfig fails, do a quick load+purge to get config
+                    logger.info("[initialize_service] AutoConfig failed, doing quick load for config...")
+                    self._load_dit()
+                    self._purge_model("model")
+                
+                # Set dtype for MPS
+                if device == "mps":
+                    self.dtype = torch.bfloat16
+                
+                actual_attn = "deferred"
+            else:
+                # Non-offload mode: load all models at once (original behavior)
+                try:
+                    self._load_models()
+                except Exception as e:
+                    logger.error(f"Failed to load models: {e}")
+                    raise e
+                actual_attn = getattr(self.config, "_attn_implementation", "eager")
+
             status_msg = f"✅ Model initialized successfully on {device}\n"
             status_msg += f"Main model: {acestep_v15_checkpoint_path}\n"
             status_msg += f"VAE: {vae_checkpoint_path}\n"
@@ -553,6 +470,191 @@ class AceStepHandler:
             if not self._is_on_target_device(self.silence_latent, self.device):
                 self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
     
+    def _apply_surgical_precision(self, model):
+        """
+        Apply surgical mixed precision for MPS:
+        - nn.Linear, nn.Conv2d -> bfloat16 (compute-heavy, safe in half precision)
+        - nn.LayerNorm, nn.GroupNorm, nn.RMSNorm -> float32 (stability-critical)
+        - Softmax layers -> float32 (numerical sensitivity)
+        """
+        logger.info("[Surgical Precision] Applying manual mixed precision casting for MPS...")
+        
+        counts = {"bf16": 0, "fp32": 0}
+
+        # Build tuple of stability-critical types
+        stability_types = [torch.nn.LayerNorm, torch.nn.GroupNorm]
+        if hasattr(torch.nn, 'RMSNorm'):
+            stability_types.append(torch.nn.RMSNorm)
+        try:
+            from transformers.models.llama.modeling_llama import LlamaRMSNorm
+            stability_types.append(LlamaRMSNorm)
+        except ImportError:
+            pass
+        try:
+            from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+            stability_types.append(Qwen2RMSNorm)
+        except ImportError:
+            pass
+        stability_types = tuple(stability_types)
+
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                module.to(dtype=torch.bfloat16)
+                counts["bf16"] += 1
+            elif isinstance(module, stability_types):
+                module.to(dtype=torch.float32)
+                counts["fp32"] += 1
+            elif isinstance(module, torch.nn.Softmax):
+                module.to(dtype=torch.float32)
+                counts["fp32"] += 1
+        
+        logger.info(f"[Surgical Precision] Cast complete: {counts['bf16']} layers to bfloat16, {counts['fp32']} layers kept in float32")
+
+    # ====================================================================
+    # TRIAD LIFECYCLE: Atomic Purge Protocol & Granular Loaders
+    # ====================================================================
+
+    def _purge_model(self, attr_name: str):
+        """
+        Atomic purge protocol. Every model transition MUST use this.
+        Sequence: model.to("cpu") -> unlink -> del -> gc -> empty_cache
+        Without model.to("cpu") first, Metal does NOT release physical memory pages.
+        """
+        model = getattr(self, attr_name, None)
+        if model is not None:
+            logger.info(f"[Purge] Moving {attr_name} to CPU before deletion...")
+            try:
+                model.to("cpu")
+            except Exception as e:
+                logger.warning(f"[Purge] Failed to move {attr_name} to CPU: {e}")
+            setattr(self, attr_name, None)
+            del model
+        
+        gc.collect()
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+        logger.info(f"[Purge] {attr_name} purged, cache cleared.")
+
+    def _load_dit(self):
+        """Load DiT model to device. Phase B of the Triad Lifecycle."""
+        if self.model is not None:
+            return
+            
+        checkpoint_dir = self.checkpoint_dir
+        config_path = self.config_path_arg
+        device = self.device
+        
+        acestep_v15_checkpoint_path = os.path.join(checkpoint_dir, config_path)
+        if not os.path.exists(acestep_v15_checkpoint_path):
+            raise FileNotFoundError(f"DiT checkpoint not found: {acestep_v15_checkpoint_path}")
+
+        if self.use_flash_attention and self.is_flash_attention_available():
+            attn_implementation = "flash_attention_2"
+            self.dtype = torch.bfloat16
+        else:
+            attn_implementation = "sdpa"
+
+        try:
+            logger.info(f"[_load_dit] Loading DiT with attention: {attn_implementation}")
+            self.model = AutoModel.from_pretrained(
+                acestep_v15_checkpoint_path, 
+                trust_remote_code=True, 
+                attn_implementation=attn_implementation,
+                torch_dtype=self.dtype
+            )
+        except Exception as e:
+            if attn_implementation == "sdpa":
+                logger.info("[_load_dit] Falling back to eager attention")
+                attn_implementation = "eager"
+                self.model = AutoModel.from_pretrained(
+                    acestep_v15_checkpoint_path, 
+                    trust_remote_code=True, 
+                    attn_implementation=attn_implementation,
+                    torch_dtype=self.dtype
+                )
+            else:
+                raise e
+
+        if device == "mps":
+            self._apply_surgical_precision(self.model)
+
+        self.model.config._attn_implementation = attn_implementation
+        self.config = self.model.config
+        
+        logger.info(f"[_load_dit] Moving DiT to {device}...")
+        self.model = self.model.to(device)
+        self.model.eval()
+        
+        if self.compile_model:
+            if not hasattr(self.model.__class__, '__len__'):
+                def _model_len(model_self): return 0
+                self.model.__class__.__len__ = _model_len
+            self.model = torch.compile(self.model)
+        
+        silence_latent_path = os.path.join(acestep_v15_checkpoint_path, "silence_latent.pt")
+        if os.path.exists(silence_latent_path):
+            self.silence_latent = torch.load(silence_latent_path).transpose(1, 2)
+            self.silence_latent = self.silence_latent.to(device).to(self.dtype)
+        
+        logger.info(f"[_load_dit] DiT loaded on {device}.")
+
+    def _load_vae(self):
+        """Load VAE model to device. Phase C of the Triad Lifecycle."""
+        if self.vae is not None:
+            return
+            
+        checkpoint_dir = self.checkpoint_dir
+        device = self.device
+        
+        vae_checkpoint_path = os.path.join(checkpoint_dir, "vae")
+        if not os.path.exists(vae_checkpoint_path):
+            raise FileNotFoundError(f"VAE checkpoint not found: {vae_checkpoint_path}")
+        
+        vae_dtype = self._get_vae_dtype(device)
+        logger.info(f"[_load_vae] Loading VAE to {device}...")
+        self.vae = AutoencoderOobleck.from_pretrained(vae_checkpoint_path, torch_dtype=vae_dtype)
+        self.vae = self.vae.to(device)
+        self.vae.eval()
+        
+        if self.compile_model:
+            if not hasattr(self.vae.__class__, '__len__'):
+                def _vae_len(vae_self): return 0
+                self.vae.__class__.__len__ = _vae_len
+            self.vae = torch.compile(self.vae)
+        
+        logger.info(f"[_load_vae] VAE loaded on {device}.")
+
+    def _load_text_encoder(self):
+        """Load text encoder to device. Phase A of the Triad Lifecycle."""
+        if self.text_encoder is not None:
+            return
+            
+        checkpoint_dir = self.checkpoint_dir
+        device = self.device
+        
+        text_encoder_path = os.path.join(checkpoint_dir, "Qwen3-Embedding-0.6B")
+        if not os.path.exists(text_encoder_path):
+            raise FileNotFoundError(f"Text encoder not found: {text_encoder_path}")
+        
+        logger.info(f"[_load_text_encoder] Loading text encoder to {device}...")
+        if self.text_tokenizer is None:
+            self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_path)
+        self.text_encoder = AutoModel.from_pretrained(text_encoder_path, torch_dtype=self.dtype)
+        self.text_encoder = self.text_encoder.to(device)
+        self.text_encoder.eval()
+        logger.info(f"[_load_text_encoder] Text encoder loaded on {device}.")
+
+    def _load_models(self):
+        """
+        Load ALL models at once. Used ONLY when offload_to_cpu=False.
+        When offload_to_cpu=True, the Triad Lifecycle loads models on-demand.
+        """
+        self._load_dit()
+        self._load_vae()
+        self._load_text_encoder()
+
     def _move_module_recursive(self, module, target_device, dtype=None, visited=None):
         """
         Recursively move a module and all its submodules to the target device.
@@ -650,71 +752,51 @@ class AceStepHandler:
     @contextmanager
     def _load_model_context(self, model_name: str):
         """
-        Context manager to load a model to GPU and offload it back to CPU after use.
+        Context manager implementing the Triad Lifecycle for model loading.
+        
+        In offload mode: Load model from disk → yield → purge (atomic).
+        In non-offload mode: yield (no-op, models are always loaded).
         
         Args:
-            model_name: Name of the model to load ("text_encoder", "vae", "model")
+            model_name: Name of the model ("text_encoder", "vae", "model")
         """
         if not self.offload_to_cpu:
             yield
             return
 
-        # If model is DiT ("model") and offload_dit_to_cpu is False, do not offload
-        if model_name == "model" and not self.offload_dit_to_cpu:
-            # Ensure it's on device if not already (should be handled by init, but safe to check)
-            model = getattr(self, model_name, None)
-            if model is not None:
-                # Check if model is on CPU, if so move to device (one-time move if it was somehow on CPU)
-                # We check the first parameter's device
-                try:
-                    param = next(model.parameters())
-                    if param.device.type == "cpu":
-                        logger.info(f"[_load_model_context] Moving {model_name} to {self.device} (persistent)")
-                        self._recursive_to_device(model, self.device, self.dtype)
-                        if hasattr(self, "silence_latent"):
-                            self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
-                except StopIteration:
-                    pass
+        # TRIAD LIFECYCLE: Load model on-demand
+        loader_map = {
+            "text_encoder": self._load_text_encoder,
+            "vae": self._load_vae,
+            "model": self._load_dit,
+        }
+        
+        loader = loader_map.get(model_name)
+        if loader is None:
+            logger.warning(f"[_load_model_context] Unknown model: {model_name}")
             yield
             return
 
-        model = getattr(self, model_name, None)
-        if model is None:
-            yield
-            return
-
-        # Load to GPU
-        logger.info(f"[_load_model_context] Loading {model_name} to {self.device}")
+        # Phase: LOAD
         start_time = time.time()
-        if model_name == "vae":
-            vae_dtype = self._get_vae_dtype()
-            self._recursive_to_device(model, self.device, vae_dtype)
-        else:
-            self._recursive_to_device(model, self.device, self.dtype)
-        
-        if model_name == "model" and hasattr(self, "silence_latent"):
-             self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
-        
+        loader()
         load_time = time.time() - start_time
         self.current_offload_cost += load_time
-        logger.info(f"[_load_model_context] Loaded {model_name} to {self.device} in {load_time:.4f}s")
+        logger.info(f"[Triad] {model_name} loaded in {load_time:.2f}s")
+        
+        # Ensure silence_latent is on device when loading DiT
+        if model_name == "model" and hasattr(self, "silence_latent") and self.silence_latent is not None:
+            self.silence_latent = self.silence_latent.to(self.device).to(self.dtype)
 
         try:
             yield
         finally:
-            # Offload to CPU
-            logger.info(f"[_load_model_context] Offloading {model_name} to CPU")
+            # Phase: PURGE (atomic protocol)
             start_time = time.time()
-            self._recursive_to_device(model, "cpu")
-            
-            # NOTE: Do NOT offload silence_latent to CPU here!
-            # silence_latent is used in many places outside of model context,
-            # so it should stay on GPU to avoid device mismatch errors.
-            
-            torch.cuda.empty_cache()
-            offload_time = time.time() - start_time
-            self.current_offload_cost += offload_time
-            logger.info(f"[_load_model_context] Offloaded {model_name} to CPU in {offload_time:.4f}s")
+            self._purge_model(model_name)
+            purge_time = time.time() - start_time
+            self.current_offload_cost += purge_time
+            logger.info(f"[Triad] {model_name} purged in {purge_time:.2f}s")
 
     def process_target_audio(self, audio_file) -> Optional[torch.Tensor]:
         """Process target audio"""
@@ -2097,7 +2179,7 @@ class AceStepHandler:
 
         # step 4: chunk mask, N x T x d
         chunk_mask = batch["chunk_masks"]
-        chunk_mask = chunk_mask.to(device).unsqueeze(-1).repeat(1, 1, target_latents.shape[2])
+        chunk_mask = chunk_mask.to(device, dtype=self.dtype).unsqueeze(-1).repeat(1, 1, target_latents.shape[2])
 
         spans = batch["spans"]
         
@@ -2232,10 +2314,10 @@ class AceStepHandler:
             metas = [metas]
             
         # Convert repainting parameters to lists
-        if isinstance(repainting_start, (int, float)):
-            repainting_start = [repainting_start]
         if isinstance(repainting_end, (int, float)):
             repainting_end = [repainting_end]
+        
+        # NOTE: Models load on-demand via _load_model_context (Triad Lifecycle)
         
         # Get batch size from captions
         batch_size = len(captions)
@@ -2345,24 +2427,29 @@ class AceStepHandler:
             generate_kwargs["timesteps"] = torch.tensor(timesteps, dtype=torch.float32)
         logger.info("[service_generate] Generating audio...")
         with self._load_model_context("model"):
-            # Prepare condition tensors first (for LRC timestamp generation)
-            encoder_hidden_states, encoder_attention_mask, context_latents = self.model.prepare_condition(
-                text_hidden_states=text_hidden_states,
-                text_attention_mask=text_attention_mask,
-                lyric_hidden_states=lyric_hidden_states,
-                lyric_attention_mask=lyric_attention_mask,
-                refer_audio_acoustic_hidden_states_packed=refer_audio_acoustic_hidden_states_packed,
-                refer_audio_order_mask=refer_audio_order_mask,
-                hidden_states=src_latents,
-                attention_mask=torch.ones(src_latents.shape[0], src_latents.shape[1], device=src_latents.device, dtype=src_latents.dtype),
-                silence_latent=self.silence_latent,
-                src_latents=src_latents,
-                chunk_masks=chunk_mask,
-                is_covers=is_covers,
-                precomputed_lm_hints_25Hz=precomputed_lm_hints_25Hz,
-            )
-            
-            outputs = self.model.generate_audio(**generate_kwargs)
+            # Wrap in autocast for MPS mixed precision
+            autocast_ctx = torch.amp.autocast(device_type="mps", dtype=torch.bfloat16) if self.device == "mps" else torch.amp.autocast(device_type="cuda", dtype=self.dtype) if self.device == "cuda" else nullcontext()
+            with autocast_ctx:
+                # Prepare condition tensors first (for LRC timestamp generation)
+                encoder_hidden_states, encoder_attention_mask, context_latents = self.model.prepare_condition(
+                    text_hidden_states=text_hidden_states,
+                    text_attention_mask=text_attention_mask,
+                    lyric_hidden_states=lyric_hidden_states,
+                    lyric_attention_mask=lyric_attention_mask,
+                    refer_audio_acoustic_hidden_states_packed=refer_audio_acoustic_hidden_states_packed,
+                    refer_audio_order_mask=refer_audio_order_mask,
+                    hidden_states=src_latents,
+                    attention_mask=torch.ones(src_latents.shape[0], src_latents.shape[1], device=src_latents.device, dtype=src_latents.dtype),
+                    silence_latent=self.silence_latent,
+                    src_latents=src_latents,
+                    chunk_masks=chunk_mask,
+                    is_covers=is_covers,
+                    precomputed_lm_hints_25Hz=precomputed_lm_hints_25Hz,
+                )
+                
+                outputs = self.model.generate_audio(**generate_kwargs)
+
+            # NOTE: DiT purge is handled by _load_model_context("model") exit
         
         # Add intermediate information to outputs for extra_outputs
         outputs["src_latents"] = src_latents
@@ -2766,14 +2853,26 @@ class AceStepHandler:
             def progress(*args, **kwargs):
                 pass
 
-        if self.model is None or self.vae is None or self.text_tokenizer is None or self.text_encoder is None:
-            return {
-                "audios": [],
-                "status_message": "❌ Model not fully initialized. Please initialize all components first.",
-                "extra_outputs": {},
-                "success": False,
-                "error": "Model not fully initialized",
-            }
+        if not self.offload_to_cpu:
+            # Non-offload mode: models must be pre-loaded
+            if self.model is None or self.vae is None or self.text_tokenizer is None or self.text_encoder is None:
+                return {
+                    "audios": [],
+                    "status_message": "❌ Model not fully initialized. Please initialize all components first.",
+                    "extra_outputs": {},
+                    "success": False,
+                    "error": "Model not fully initialized",
+                }
+        else:
+            # Offload mode (Triad Lifecycle): models load on-demand. Just check config.
+            if not hasattr(self, 'checkpoint_dir') or not self.checkpoint_dir:
+                return {
+                    "audios": [],
+                    "status_message": "❌ Not initialized. Call initialize_service first.",
+                    "extra_outputs": {},
+                    "success": False,
+                    "error": "Not initialized",
+                }
 
         def _has_audio_codes(v: Union[str, List[str]]) -> bool:
             if isinstance(v, list):
@@ -2920,14 +3019,17 @@ class AceStepHandler:
                     
                     # Transpose for VAE decode: [batch, latent_length, latent_dim] -> [batch, latent_dim, latent_length]
                     pred_latents_for_decode = pred_latents.transpose(1, 2).contiguous()
-                    # Ensure input is in VAE's dtype
-                    pred_latents_for_decode = pred_latents_for_decode.to(self.vae.dtype)
+                    # Ensure input is in VAE's dtype and on the right device
+                    pred_latents_for_decode = pred_latents_for_decode.to(device=self.device, dtype=self.vae.dtype)
                     
                     # Release original pred_latents to free VRAM before VAE decode
                     del pred_latents
-                    torch.cuda.empty_cache()
+                    if self.device == "mps":
+                        torch.mps.empty_cache()
+                    elif self.device == "cuda":
+                        torch.cuda.empty_cache()
                     
-                    logger.debug(f"[generate_music] Before VAE decode: allocated={torch.cuda.memory_allocated()/1024**3:.2f}GB, max={torch.cuda.max_memory_allocated()/1024**3:.2f}GB")
+                    logger.debug(f"[generate_music] Before VAE decode on {self.device}")
                     
                     if use_tiled_decode:
                         logger.info("[generate_music] Using tiled VAE decode to reduce VRAM usage...")
@@ -2937,7 +3039,8 @@ class AceStepHandler:
                         pred_wavs = decoder_output.sample
                         del decoder_output
                     
-                    logger.debug(f"[generate_music] After VAE decode: allocated={torch.cuda.memory_allocated()/1024**3:.2f}GB, max={torch.cuda.max_memory_allocated()/1024**3:.2f}GB")
+                    
+                    logger.debug(f"[generate_music] After VAE decode on {self.device}")
                     
                     # Release pred_latents_for_decode after decode
                     del pred_latents_for_decode
@@ -2946,7 +3049,8 @@ class AceStepHandler:
                     if pred_wavs.dtype != torch.float32:
                         pred_wavs = pred_wavs.float()
                     
-                    torch.cuda.empty_cache()
+                    
+                    # NOTE: VAE purge is handled by _load_model_context("vae") exit
             end_time = time.time()
             time_costs["vae_decode_time_cost"] = end_time - start_time
             time_costs["total_time_cost"] = time_costs["total_time_cost"] + time_costs["vae_decode_time_cost"]
