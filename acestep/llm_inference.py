@@ -408,11 +408,24 @@ class LLMHandler:
             if self.offload_to_cpu:
                 # TRIAD LIFECYCLE: Do NOT load LLM at init.
                 # Just validate the model path exists. LLM loads on-demand.
+                # However, Tokenizer and ConstrainedProcessor MUST be loaded for input prep.
                 full_lm_model_path = os.path.join(self.checkpoint_dir, self.lm_model_path)
                 if not os.path.exists(full_lm_model_path):
                     return f"❌ 5Hz LM model not found at {full_lm_model_path}", False
-                logger.info(f"[initialize] Offload mode: skipping LLM loading (path validated: {full_lm_model_path})")
-                return f"✅ 5Hz LM ready (deferred loading, path: {full_lm_model_path})", True
+                
+                logger.info(f"[initialize] Offload mode: loading tokenizer only (deferred LLM loading).")
+                if self.llm_tokenizer is None:
+                    self.llm_tokenizer = AutoTokenizer.from_pretrained(full_lm_model_path, use_fast=True)
+                
+                if self.constrained_processor is None:
+                    gpu_config = get_global_gpu_config()
+                    self.constrained_processor = MetadataConstrainedLogitsProcessor(
+                        tokenizer=self.llm_tokenizer,
+                        enabled=True,
+                        max_duration=gpu_config.max_duration_with_lm,
+                    )
+                
+                return f"✅ 5Hz LM tokenizer ready (deferred model loading, path: {full_lm_model_path})", True
             else:
                 result = self._load_models()
                 return result

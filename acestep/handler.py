@@ -430,6 +430,21 @@ class AceStepHandler:
                 if device == "mps":
                     self.dtype = torch.bfloat16
                 
+                # Load silence_latent — tiny data tensor (~400KB), NOT a model.
+                # Must persist in memory for _prepare_batch to use between phases.
+                silence_latent_path = os.path.join(acestep_v15_checkpoint_path, "silence_latent.pt")
+                if os.path.exists(silence_latent_path):
+                    self.silence_latent = torch.load(silence_latent_path, weights_only=True).transpose(1, 2)
+                    self.silence_latent = self.silence_latent.to(device).to(self.dtype)
+                    logger.info(f"[initialize_service] silence_latent loaded ({self.silence_latent.shape}, {self.silence_latent.dtype})")
+                else:
+                    logger.warning(f"[initialize_service] silence_latent.pt not found at {silence_latent_path}")
+                
+                # Load Tokenizers — tiny (~1MB), must be persistent for _prepare_batch.
+                logger.info("[initialize_service] Loading tokenizers...")
+                from transformers import AutoTokenizer
+                self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_path)
+                
                 actual_attn = "deferred"
             else:
                 # Non-offload mode: load all models at once (original behavior)
@@ -1744,32 +1759,35 @@ class AceStepHandler:
             if target_wavs.device != self.device:
                 target_wavs = target_wavs.to(self.device)
             
-            with self._load_model_context("vae"):
-                for i in range(batch_size):
-                    code_hint = audio_code_hints[i]
-                    # Prefer decoding from provided audio codes
-                    if code_hint:
-                        logger.info(f"[generate_music] Decoding audio codes for item {i}...")
-                        decoded_latents = self._decode_audio_codes_to_latents(code_hint)
-                        if decoded_latents is not None:
-                            decoded_latents = decoded_latents.squeeze(0)
-                            target_latents_list.append(decoded_latents)
-                            latent_lengths.append(decoded_latents.shape[0])
-                            # Create a silent wav matching the latent length for downstream scaling
-                            frames_from_codes = max(1, int(decoded_latents.shape[0] * 1920))
-                            target_wavs_list[i] = torch.zeros(2, frames_from_codes)
-                            continue
-                    # Fallback to VAE encode from audio
-                    current_wav = target_wavs_list[i].to(self.device).unsqueeze(0)
-                    if self.is_silence(current_wav):
-                        expected_latent_length = current_wav.shape[-1] // 1920
-                        target_latent = self.silence_latent[0, :expected_latent_length, :]
-                    else:
-                        # Encode using helper method
-                        logger.info(f"[generate_music] Encoding target audio to latents for item {i}...")
+            for i in range(batch_size):
+                code_hint = audio_code_hints[i]
+                # Prefer decoding from provided audio codes (DI-T PHASE)
+                if code_hint:
+                    logger.info(f"[generate_music] Decoding audio codes for item {i}...")
+                    # _decode_audio_codes_to_latents handles its own 'model' (DiT) context
+                    decoded_latents = self._decode_audio_codes_to_latents(code_hint)
+                    if decoded_latents is not None:
+                        decoded_latents = decoded_latents.squeeze(0)
+                        target_latents_list.append(decoded_latents)
+                        latent_lengths.append(decoded_latents.shape[0])
+                        # Create a silent wav matching the latent length for downstream scaling
+                        frames_from_codes = max(1, int(decoded_latents.shape[0] * 1920))
+                        target_wavs_list[i] = torch.zeros(2, frames_from_codes)
+                        continue
+                
+                # Fallback to VAE encode from audio or silence
+                current_wav = target_wavs_list[i].to(self.device).unsqueeze(0)
+                if self.is_silence(current_wav):
+                    expected_latent_length = current_wav.shape[-1] // 1920
+                    target_latent = self.silence_latent[0, :expected_latent_length, :]
+                else:
+                    # Encode using helper method (VAE PHASE)
+                    logger.info(f"[generate_music] Encoding target audio to latents for item {i}...")
+                    with self._load_model_context("vae"):
                         target_latent = self._encode_audio_to_latents(current_wav.squeeze(0))  # Remove batch dim for helper
-                    target_latents_list.append(target_latent)
-                    latent_lengths.append(target_latent.shape[0])
+                
+                target_latents_list.append(target_latent)
+                latent_lengths.append(target_latent.shape[0])
              
             # Pad target_wavs to consistent length for outputs
             max_target_frames = max(wav.shape[-1] for wav in target_wavs_list)
@@ -2170,11 +2188,41 @@ class AceStepHandler:
         bs = target_latents.shape[0]
         device = target_latents.device
 
-        # step 2: refer_audio timbre
+        # step 2: Text prompt and lyrics (PHASE A)
+        text_token_idss = batch["text_token_idss"]
+        text_attention_mask = batch["text_attention_masks"]
+        lyric_token_idss = batch["lyric_token_idss"]
+        lyric_attention_mask = batch["lyric_attention_masks"]
+        text_inputs = batch["text_inputs"]
+        is_covers = batch["is_covers"]
+        precomputed_lm_hints_25Hz = batch.get("precomputed_lm_hints_25Hz", None)
+        non_cover_text_input_ids = batch.get("non_cover_text_input_ids", None)
+        non_cover_text_attention_masks = batch.get("non_cover_text_attention_masks", None)
+        
+        text_hidden_states = None
+        lyric_hidden_states = None
+        non_cover_text_hidden_states = None
+
+        logger.info("[preprocess_batch] Phase A: Inferring text embeddings...")
+        with self._load_model_context("text_encoder"):
+            text_hidden_states = self.infer_text_embeddings(text_token_idss)
+            logger.info("[preprocess_batch] Phase A: Inferring lyric embeddings...")
+            lyric_hidden_states = self.infer_lyric_embeddings(lyric_token_idss)
+            
+            if non_cover_text_input_ids is not None:
+                logger.info("[preprocess_batch] Phase A: Inferring non-cover text embeddings...")
+                non_cover_text_hidden_states = self.infer_text_embeddings(non_cover_text_input_ids)
+
+        # step 3: refer_audio timbre (PHASE B-ish or Sub-Phase A)
         keys = batch["keys"]
+        refer_audio_acoustic_hidden_states_packed = None
+        refer_audio_order_mask = None
+        
+        logger.info("[preprocess_batch] Phase B: Inferring refer audio latents...")
         with self._load_model_context("vae"):
             refer_audio_acoustic_hidden_states_packed, refer_audio_order_mask = self.infer_refer_latent(batch["refer_audioss"])
-        if refer_audio_acoustic_hidden_states_packed.dtype != dtype:
+            
+        if refer_audio_acoustic_hidden_states_packed is not None and refer_audio_acoustic_hidden_states_packed.dtype != dtype:
             refer_audio_acoustic_hidden_states_packed = refer_audio_acoustic_hidden_states_packed.to(dtype)
 
         # step 4: chunk mask, N x T x d
@@ -2182,31 +2230,6 @@ class AceStepHandler:
         chunk_mask = chunk_mask.to(device, dtype=self.dtype).unsqueeze(-1).repeat(1, 1, target_latents.shape[2])
 
         spans = batch["spans"]
-        
-        text_token_idss = batch["text_token_idss"]
-        text_attention_mask = batch["text_attention_masks"]
-        lyric_token_idss = batch["lyric_token_idss"]
-        lyric_attention_mask = batch["lyric_attention_masks"]
-        text_inputs = batch["text_inputs"]
-
-        logger.info("[preprocess_batch] Inferring prompt embeddings...")
-        with self._load_model_context("text_encoder"):
-            text_hidden_states = self.infer_text_embeddings(text_token_idss)
-            logger.info("[preprocess_batch] Inferring lyric embeddings...")
-            lyric_hidden_states = self.infer_lyric_embeddings(lyric_token_idss)
-
-            is_covers = batch["is_covers"]
-            
-            # Get precomputed hints from batch if available
-            precomputed_lm_hints_25Hz = batch.get("precomputed_lm_hints_25Hz", None)
-            
-            # Get non-cover text input ids and attention masks from batch if available
-            non_cover_text_input_ids = batch.get("non_cover_text_input_ids", None)
-            non_cover_text_attention_masks = batch.get("non_cover_text_attention_masks", None)
-            non_cover_text_hidden_states = None
-            if non_cover_text_input_ids is not None:
-                logger.info("[preprocess_batch] Inferring non-cover text embeddings...")
-                non_cover_text_hidden_states = self.infer_text_embeddings(non_cover_text_input_ids)
 
         return (
             keys,
@@ -3132,6 +3155,15 @@ class AceStepHandler:
                 "success": False,
                 "error": str(e),
             }
+        finally:
+            # Crash-safety: purge any models still loaded after error or success.
+            # In offload mode, models should already be purged by _load_model_context,
+            # but if an exception bypassed the context manager, clean up here.
+            if self.offload_to_cpu:
+                for attr in ["model", "vae", "text_encoder"]:
+                    if getattr(self, attr, None) is not None:
+                        logger.warning(f"[generate_music] Emergency purge: {attr} still loaded after generate")
+                        self._purge_model(attr)
 
     @torch.no_grad()
     def get_lyric_timestamp(
